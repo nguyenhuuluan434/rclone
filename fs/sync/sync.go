@@ -319,8 +319,8 @@ func (s *syncCopyMove) pairChecker(in *pipe, out *pipe, fraction int, wg *sync.W
 			if !NoNeedTransfer && operations.NeedTransfer(s.ctx, pair.Dst, pair.Src) {
 				// If files are treated as immutable, fail if destination exists and does not match
 				if s.ci.Immutable && pair.Dst != nil {
-					fs.Errorf(pair.Dst, "Source and destination exist but do not match: immutable file modified")
-					s.processError(fs.ErrorImmutableModified)
+					fs.Errorf(pair.Dst, "Source and destination exist but do not match: %v", fs.ErrorImmutableModified)
+					s.processError(fserrors.NoRetryError(fs.ErrorImmutableModified))
 				} else {
 					// If destination already exists, then we must move it into --backup-dir if required
 					if pair.Dst != nil && s.backupDir != nil {

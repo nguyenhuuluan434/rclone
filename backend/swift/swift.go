@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/google/uuid"
 	"io"
 	"net/url"
 	"path"
@@ -902,16 +903,97 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		fs.Debugf(src, "Can't copy - not same remote type")
 		return nil, fs.ErrorCantCopy
 	}
-	srcContainer, srcPath := srcObj.split()
-	err = f.pacer.Call(func() (bool, error) {
-		var rxHeaders swift.Headers
-		rxHeaders, err = f.c.ObjectCopy(srcContainer, srcPath, dstContainer, dstPath, nil)
-		return shouldRetryHeaders(rxHeaders, err)
-	})
+	isLargeObject, err := srcObj.isLargeObject()
+	if err != nil {
+		return nil, err
+	}
+	if isLargeObject {
+		/*handle large object*/
+		err = copyLargeObject(ctx, f, srcObj, dstContainer, dstPath)
+	} else {
+		srcContainer, srcPath := srcObj.split()
+		err = f.pacer.Call(func() (bool, error) {
+			var rxHeaders swift.Headers
+			rxHeaders, err = f.c.ObjectCopy(srcContainer, srcPath, dstContainer, dstPath, nil)
+			return shouldRetryHeaders(rxHeaders, err)
+		})
+	}
 	if err != nil {
 		return nil, err
 	}
 	return f.NewObject(ctx, remote)
+}
+
+func copyLargeObject(ctx context.Context, f *Fs, src *Object, dstContainer string, dstPath string) error {
+	segmentsContainer := dstContainer + "_segments"
+	err := f.makeContainer(ctx, segmentsContainer)
+	if err != nil {
+		return err
+	}
+	segments, err := src.getSegmentsLargeObject()
+	if err != nil {
+		return err
+	}
+	if len(segments) == 0 {
+		return errors.New("could not copy object, list segments are empty")
+	}
+	prefixSegment := fmt.Sprintf("%s/%v/%s", dstPath, src.size, strings.ReplaceAll(uuid.New().String(), "-", ""))
+	for _, value := range segments {
+		if len(value) <= 0 {
+			continue
+		}
+		fragment := value[0]
+		if len(fragment) <= 0 {
+			continue
+		}
+		firstIndex := strings.Index(fragment, "/")
+		if firstIndex < 0 {
+			firstIndex = 0
+		} else {
+			firstIndex = firstIndex + 1
+		}
+		lastIndex := strings.LastIndex(fragment, "/")
+		if lastIndex < 0 {
+			lastIndex = len(fragment)
+		} else {
+			lastIndex = lastIndex - 1
+		}
+		prefixSegment = fragment[firstIndex:lastIndex]
+		break
+	}
+	for c, ss := range segments {
+		if len(ss) <= 0 {
+			continue
+		}
+		for _, s := range ss {
+			lastIndex := strings.LastIndex(s, "/")
+			if lastIndex <= 0 {
+				lastIndex = 0
+			} else {
+				lastIndex = lastIndex + 1
+			}
+			segmentName := dstPath + "/" + prefixSegment + "/" + s[lastIndex:]
+			err = f.pacer.Call(func() (bool, error) {
+				var rxHeaders swift.Headers
+				rxHeaders, err = f.c.ObjectCopy(c, s, segmentsContainer, segmentName, nil)
+				return shouldRetryHeaders(rxHeaders, err)
+			})
+			if err != nil {
+				return err
+			}
+		}
+	}
+	m := swift.Metadata{}
+	headers := m.ObjectHeaders()
+	headers["X-Object-Manifest"] = urlEncode(fmt.Sprintf("%s/%s/%s", segmentsContainer, dstPath, prefixSegment))
+	headers["Content-Length"] = "0"
+	emptyReader := bytes.NewReader(nil)
+	err = f.pacer.Call(func() (bool, error) {
+		var rxHeaders swift.Headers
+		rxHeaders, err = f.c.ObjectPut(dstContainer, dstPath, emptyReader, true, "", src.contentType, headers)
+		return shouldRetryHeaders(rxHeaders, err)
+	})
+	return err
 }
 
 // Hashes returns the supported hash sets.
